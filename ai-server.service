@@ -1,0 +1,28 @@
+[Unit]
+Description=AI Recipe Server
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=tsangc1
+Group=tsangc1
+WorkingDirectory=/home/tsangc1/Projects/ai_service
+Environment=PATH=/home/tsangc1/Projects/ai_service/.venv/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+Environment=CUDA_LAUNCH_BLOCKING=1
+Environment=TORCH_USE_CUDA_DSA=1
+Environment=PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
+Environment=TRANSFORMERS_CACHE=/home/tsangc1/.cache/huggingface
+Environment=HF_HOME=/home/tsangc1/.cache/huggingface
+ExecStart=/home/tsangc1/Projects/ai_service/.venv/bin/uvicorn app:app --host 0.0.0.0 --port 8001 --env-file .env
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Environment variables (if needed)
+Environment=HUGGINGFACE_HUB_TOKEN=your_token_here
+
+[Install]
+WantedBy=multi-user.target 

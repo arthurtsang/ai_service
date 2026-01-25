@@ -1,0 +1,62 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Environment variables
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.log
+
+# Test files and working scripts
+test_*.py
+*_test.py
+*_minimal.py
+
+# Old/backup files
+app_old.py
+app_original.py
+app_new.py
+get-pip.py
+pre-download-model.py
+
+# Certificates and keys
+*.crt
+*.key
+*.pem
+
+# Working documentation
+SYSTEMD_SETUP.md
+
+# Model cache (optional - uncomment if you don't want to track model downloads)
+# .cache/
+# models/
+
+# OS files
+.DS_Store
+Thumbs.db
