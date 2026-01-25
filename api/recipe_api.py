@@ -3,19 +3,45 @@ Recipe API endpoints for AI Service
 Handles recipe analysis, import, categorization, and chat
 """
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request, Depends
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from typing import Dict, Any, Optional
 import logging
+import os
 
 from services.recipe_analysis_service import RecipeAnalysisService
-from services.import_service import extract_recipe_with_llm, ImportRecipeRequest, ImportRecipeResponse
+from services.import_service import import_recipe_from_url, ImportRecipeRequest, ImportRecipeResponse
 from services.chat_service import generate_chat_response, ChatRequest, ChatResponse
 
 logger = logging.getLogger(__name__)
 
 # Create router for recipe endpoints
 router = APIRouter(prefix="/recipe", tags=["recipe"])
+
+# Security for internal API access
+security = HTTPBearer(auto_error=False)
+
+async def verify_internal_access(request: Request, credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)):
+    """
+    Verify that the request is from an internal service (localhost) or has a valid API key.
+    This protects the AI service from being called directly by external users.
+    """
+    # Allow requests from localhost (internal services)
+    client_host = request.client.host if request.client else None
+    if client_host in ["127.0.0.1", "localhost", "::1"]:
+        return True
+    
+    # Check for API key in Authorization header
+    api_key = os.getenv("AI_SERVICE_API_KEY")
+    if api_key and credentials and credentials.credentials == api_key:
+        return True
+    
+    # Reject external requests without valid credentials
+    raise HTTPException(
+        status_code=403,
+        detail="Access denied. This is an internal service endpoint."
+    )
 
 # Pydantic models
 class RecipeAnalysisRequest(BaseModel):
@@ -78,10 +104,11 @@ async def analyze_recipe(request: RecipeAnalysisRequest):
         logger.error(f"Error analyzing recipe: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Recipe analysis failed: {str(e)}")
 
-@router.post("/import")
+@router.post("/import", dependencies=[Depends(verify_internal_access)])
 async def import_recipe(request: ImportRecipeRequest):
     """
     Import a recipe from an external URL
+    This endpoint is only accessible from internal services (localhost) or with a valid API key.
     """
     try:
         logger.info(f"Importing recipe from: {request.url}")
@@ -90,7 +117,7 @@ async def import_recipe(request: ImportRecipeRequest):
             raise HTTPException(status_code=503, detail="Model not initialized")
         
         # Import the recipe using the existing function
-        imported_data = await extract_recipe_with_llm(request.url, model, tokenizer, device)
+        imported_data = await import_recipe_from_url(request.url, model, tokenizer, device)
         
         return imported_data
         

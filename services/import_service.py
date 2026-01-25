@@ -435,7 +435,7 @@ def create_cook_time_difficulty_prompt(visible_text):
         '  "difficulty": "Easy|Medium|Advanced"\n'
         "}\n\n"
         "Rules:\n"
-        "- cookTime: Find 'Total Time' and convert to total minutes (e.g., '3 hrs 5 mins' = '185')\n"
+        "- cookTime: Find 'Total Time' and convert to total minutes as a STRING (e.g., '3 hrs 5 mins' = '185', return as '185' not 185)\n"
         "- difficulty: Find explicit terms or infer from recipe complexity\n"
         "- Return only the JSON object\n\n"
         f"Text to analyze:\n{visible_text}\n\n"
@@ -530,8 +530,12 @@ def extract_recipe_with_llm(visible_text, model, tokenizer, device):
     # Parse the time/difficulty JSON response
     time_diff_data = parse_llm_response(time_diff_response, model, tokenizer, device)
     
-    # Merge the data
+    # Merge the data, ensuring cookTime is a string
     if time_diff_data:
+        # Convert cookTime to string if it's a number
+        if "cookTime" in time_diff_data and time_diff_data["cookTime"] is not None:
+            if isinstance(time_diff_data["cookTime"], (int, float)):
+                time_diff_data["cookTime"] = str(time_diff_data["cookTime"])
         data.update(time_diff_data)
     
     return data
@@ -606,12 +610,23 @@ async def import_recipe_from_url(url: str, model, tokenizer, device) -> ImportRe
         cook_time = data.get("cookTime")
         difficulty = data.get("difficulty")
         
+        # Convert cookTime to string if it's a number
+        if cook_time is not None:
+            if isinstance(cook_time, (int, float)):
+                cook_time = str(cook_time)
+            elif cook_time == "null":
+                cook_time = None
+        
         # If LLM didn't find cook time, try to extract it from the cleaned text
-        if not cook_time or cook_time == "null" or cook_time == "Pending...":
+        if not cook_time or cook_time == "Pending...":
             cook_time = extract_cook_time_from_text(visible_text)
             time_reasoning = "Extracted from page text" if cook_time else ""
         else:
             time_reasoning = "Imported from recipe"
+            
+        # Ensure cook_time is a string
+        if cook_time and not isinstance(cook_time, str):
+            cook_time = str(cook_time)
             
         difficulty_reasoning = "Imported from recipe" if difficulty and difficulty != "Undetermined" else ""
         
