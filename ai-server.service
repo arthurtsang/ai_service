@@ -25,4 +25,4 @@ StandardError=journal
 Environment=HUGGINGFACE_HUB_TOKEN=your_token_here
 
 [Install]
-WantedBy=multi-user.target 
+WantedBy=multi-user.target
