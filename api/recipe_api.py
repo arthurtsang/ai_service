@@ -17,6 +17,8 @@ import os
 from services.recipe_analysis_service import RecipeAnalysisService
 from services.import_service import import_recipe_from_url, ImportRecipeRequest, ImportRecipeResponse
 from services.chat_service import generate_chat_response, ChatRequest, ChatResponse
+from utils.llm_thread import run_llm_in_thread
+import torch
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +70,13 @@ class AutoCategoryRequest(BaseModel):
 
 class ChatRequest(BaseModel):
     question: str
+
+
+class DebugPromptRequest(BaseModel):
+    """Request body for /recipe/debug-prompt - test a raw prompt and see exact model output."""
+    prompt: str
+    max_new_tokens: int = 512
+
 
 # Global service instances (will be initialized with model/tokenizer)
 recipe_service: Optional[RecipeAnalysisService] = None
@@ -246,6 +255,47 @@ async def chat(request: ChatRequest):
     except Exception as e:
         logger.error(f"Error in chat: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Chat failed: {str(e)}")
+
+@router.post("/debug-prompt", dependencies=[Depends(verify_internal_access)])
+async def debug_prompt(body: DebugPromptRequest):
+    """
+    Send a raw prompt to the model and get the exact decoded output.
+    Use this to test prompts and see what the model actually returns (including any instruction echo).
+    The model returns the full sequence (prompt + generated tokens); there is no separate reasoning field.
+    """
+    if model is None or tokenizer is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+    device_val = device if device is not None else (next(model.parameters()).device)
+
+    def _generate(prompt: str, max_new_tokens: int):
+        inputs = tokenizer(prompt, return_tensors="pt").to(device_val)
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                pad_token_id=tokenizer.eos_token_id,
+            )
+        full_decoded = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        return full_decoded
+
+    try:
+        raw_output = await run_llm_in_thread(_generate, body.prompt, body.max_new_tokens)
+        # What we'd normally treat as "the model's answer" (content after the prompt)
+        if raw_output.startswith(body.prompt):
+            generated_only = raw_output[len(body.prompt):].strip()
+        else:
+            generated_only = raw_output
+        return {
+            "raw_output": raw_output,
+            "generated_only": generated_only,
+            "prompt_length": len(body.prompt),
+            "raw_output_length": len(raw_output),
+            "note": "Full sequence is prompt + generated. No separate reasoning field; any reasoning is in the text.",
+        }
+    except Exception as e:
+        logger.exception("debug-prompt failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @router.get("/health")
 async def recipe_health():

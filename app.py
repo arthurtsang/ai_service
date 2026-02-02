@@ -104,6 +104,15 @@ async def legacy_chat(request):
     # This will be handled by the recipe router
     return await recipe_router.routes[3].endpoint(request)
 
+
+@app.post("/debug-prompt")
+async def legacy_debug_prompt(request: Request):
+    """Legacy endpoint - same as POST /recipe/debug-prompt. Test a prompt and get raw model output."""
+    body = await request.json()
+    from api.recipe_api import DebugPromptRequest
+    parsed = DebugPromptRequest(**body)
+    return await recipe_router.routes[5].endpoint(parsed)
+
 # Include routers
 app.include_router(recipe_router)
 app.include_router(kungfu_router)

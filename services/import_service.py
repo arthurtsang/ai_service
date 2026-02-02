@@ -10,7 +10,7 @@ from typing import Dict, Any, List, Optional
 from bs4 import BeautifulSoup, Comment
 from playwright.async_api import async_playwright
 from pydantic import BaseModel
-from utils.json_parser import parse_llm_response, extract_json_from_markdown
+from utils.json_parser import parse_llm_response, extract_json_from_markdown, _extract_balanced_json
 from utils.llm_thread import run_llm_in_thread
 
 
@@ -464,16 +464,52 @@ def create_markdown_extraction_prompt(visible_text):
     )
 
 
-def _description_looks_like_dump(description: str) -> bool:
-    """True if description is ingredients/instructions pasted, image caption, or echoed prompt label (not a real summary)."""
+def _description_looks_like_dump(description: str, title: Optional[str] = None) -> bool:
+    """True if description is pasted content, image caption, echoed prompt, or mostly the title (not a real one-sentence summary)."""
     if not description:
         return False
     d = description.strip()
     dl = d.lower()
-    # Only treat as dump when description *starts with* "Example:" or "Example " (prompt label). Do not flag "example" mid-sentence.
-    if dl.startswith("example:") or dl.startswith("example "):
+    # Can't be mostly or entirely the recipe title
+    if title and title.strip():
+        t = title.strip()
+        tl = t.lower()
+        if d.lower() == tl or dl == tl:
+            return True
+        if dl.startswith("recipe:") and d[len("recipe:"):].strip().lower() == tl:
+            return True
+        if len(d) <= len(t) + 25 and tl in dl:
+            return True
+        # Title is majority of description (e.g. "Recipe: Basic Pound Cake (Improved Apr 2023)" with nothing else)
+        rest = dl.replace("recipe:", "").strip()
+        if rest == tl or (len(rest) <= len(tl) + 15 and tl in rest):
+            return True
+    # Echoed instruction (model repeated prompt instead of answering)
+    if dl.startswith("output only") or dl.startswith("output that one") or "then '---end---'" in dl or "then write exactly" in dl:
+        return True
+    if dl.startswith("give one short") or ("that describes this dish" in dl and "220" in dl):
+        return True
+    if "appetizing sentence that describes this dish" in dl or (dl.startswith("appetizing sentence") and "this dish" in dl):
+        return True
+    if dl.startswith("replace with the short") or dl.startswith("replace with the appetizing") or "replace with the short appetizing sentence" in dl:
+        return True
+    if dl.startswith("reply with only") or dl.startswith("reply with the short") or "reply with only that sentence" in dl:
+        return True
+    if dl.startswith("write one short") and ("this dish" in dl or "220" in dl):
+        return True
+    if dl.startswith("recipe name:") or dl.startswith("recipe name ") or dl.startswith("recipe title:"):
+        return True
+    if dl.startswith("you are an expert food writer") or "write a short appetizing description for this recipe" in dl:
+        return True
+    if dl.startswith("example:") or dl.startswith("example ") or dl.startswith("from the recipe page below"):
         return True
     if dl.startswith("image:") or (dl.startswith("image ") and ("/" in d or "upload" in dl)):
+        return True
+    # Very short and looks like instruction fragment
+    if len(d) < 30 and any(x in dl for x in ("sentence", "chars", "below", "only that", "replace with", "reply with")):
+        return True
+    # Can't be a question (model answered with a question instead of a description)
+    if d.endswith("?") or dl.startswith(("how ", "what ", "when ", "why ", "which ", "can ", "should ", "do ", "does ", "is ", "are ", "will ", "would ", "could ")):
         return True
     if len(d) < 50:
         return False
@@ -487,37 +523,44 @@ def _description_looks_like_dump(description: str) -> bool:
 
 
 def create_description_extraction_prompt(visible_text: str, title: str, ingredients_excerpt: str, instructions_excerpt: str) -> str:
-    """Prompt for description only: extract from page or write one from context. No labels to echo."""
+    """Prompt for description only. Send full page so the model can find a description embedded in the cleaned HTML."""
     return (
-        "From the page text below, output a single short appetizing sentence that describes this recipe. "
-        "If the page has a summary or intro sentence, use that (shortened to under 220 characters). "
-        "If not, write one sentence from the recipe name and context. "
-        "Do not output labels, headings, or the word 'Recipe'. Do not list ingredients or instructions. "
-        "Example good output: A classic buttery pound cake with a tender crumb.\n\n"
-        f"Recipe name: {title}\n\n"
-        "Page text (excerpt):\n"
+        "From the recipe page below, give one short appetizing sentence that describes this dish (under 220 chars). "
+        "Use a summary from the page if there is one; otherwise write one sentence from the title and context. "
+        "No labels, no list of ingredients. Return ONLY a JSON object with key \"desc\" and the sentence as value.\n\n"
+        f"Recipe: {title}\n\n"
         f"{visible_text[:4000]}\n\n"
-        "Output only that one sentence, then '---END---'."
+        'Example: {"desc": "A classic buttery pound cake with a tender crumb."}'
     )
 
 
 def _strip_echoed_prompt_from_description(description: str, title: str) -> str:
-    """Remove common prompt labels if the model echoed them; return first line that looks like a real description."""
+    """Remove echoed prompt phrases so we keep only the actual description (works across many recipe sites)."""
     if not description or not description.strip():
         return ""
     d = description.strip()
-    # Strip common echoed prefixes
+    # Strip echoed instruction fragments (exact or partial)
     for prefix in (
-        "Recipe title:", "Recipe context", "Ingredients (excerpt):", "Instructions (excerpt):",
+        "Output only that one sentence", "Output only that one", "Reply with only that sentence",
+        "Replace with the short appetizing sentence", "Replace with the short appetizing", "Replace with the short",
+        "Recipe title:", "Recipe name:", "The dish is:", "Recipe:", "Recipe: ",
+        "Recipe context", "Ingredients (excerpt):", "Instructions (excerpt):",
         "Image:", "Example:", "Example good output:", "Description:",
+        "From the recipe page below, ", "give one short",
+        "You are an expert food writer. ", "You are an expert food writer.",
+        "then '---END---'", "then write exactly", "End with ---END---",
     ):
         if d.lower().startswith(prefix.lower()):
             d = d[len(prefix):].strip()
             break
+    # If the whole thing is just the stop marker or empty, nothing useful
+    d = d.replace("---END---", "").strip()
+    if not d:
+        return ""
     lines = [ln.strip() for ln in d.split("\n") if ln.strip()]
     for line in lines:
-        if 20 <= len(line) <= 250:
-            if line.lower().startswith(("recipe title", "ingredients", "instructions", "image:", "example")):
+        if 15 <= len(line) <= 250:
+            if line.lower().startswith(("recipe title", "recipe name", "ingredients", "instructions", "image:", "example", "reply with", "replace with the short", "output only")):
                 continue
             if line.startswith("- ") or (len(line) > 2 and line[0].isdigit() and line[1] in ".)"):
                 continue
@@ -537,57 +580,105 @@ def _create_description_generation_prompt(title: str, ingredients: str, instruct
         "Instructions (excerpt):\n"
         f"{instructions[:1500]}\n\n"
         "Write ONE or TWO short sentences (around 200 characters total) that capture the essence of this dish. "
-        "Mention key flavors or meal type. No bullet points, no formatting.\n\n"
-        "IMPORTANT: Keep it under 220 characters. End your response with '---END---'."
+        "Mention key flavors or meal type. No bullet points, no formatting. "
+        "Return ONLY a JSON object with key \"desc\" and the description as value. Keep desc under 220 characters.\n\n"
+        'Example: {"desc": "A classic buttery pound cake with a tender crumb."}'
     )
 
 
+def _parse_desc_json(raw: str) -> Optional[str]:
+    """Parse JSON with key 'desc' from raw model output. Returns the desc string or None."""
+    raw = raw.strip()
+    try:
+        data = json.loads(raw)
+        if isinstance(data.get("desc"), str):
+            return data["desc"].strip()
+        return None
+    except json.JSONDecodeError:
+        pass
+    data = _extract_balanced_json(raw)
+    if data and isinstance(data.get("desc"), str):
+        return data["desc"].strip()
+    return None
+
+
+def _write_desc_debug(prefix: str, prompt: str, prompt_length_tokens: int, raw_generated: str, generated_token_count: int) -> None:
+    """Write prompt and raw model output to /tmp/recipe_debug/ for debugging."""
+    import os
+    debug_dir = "/tmp/recipe_debug"
+    os.makedirs(debug_dir, exist_ok=True)
+    path = os.path.join(debug_dir, f"{prefix}_{int(time.time())}.txt")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(f"=== PROMPT (chars={len(prompt)}, tokens={prompt_length_tokens}) ===\n\n")
+        f.write(prompt)
+        f.write("\n\n=== RAW MODEL OUTPUT (generated tokens={}) ===\n\n".format(generated_token_count))
+        f.write(raw_generated)
+    print(f"[import-recipe] Description debug saved to {path}")
+
+
 def _get_description_with_llm(visible_text: str, title: str, ingredients_str: str, instructions_str: str, model, tokenizer, device) -> str:
-    """Second call: description only. Returns stripped description, max 220 chars."""
+    """Second call: description only. Sends full page so model can find embedded description; on echo/dump we retry with generate."""
     prompt = create_description_extraction_prompt(
         visible_text, title,
         ingredients_str[:500], instructions_str[:500]
     )
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
+    prompt_length_tokens = inputs.input_ids.shape[1]
     with torch.no_grad():
         outputs = model.generate(**inputs, max_new_tokens=256, pad_token_id=tokenizer.eos_token_id)
-    text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    if "---END---" in text:
-        response = text.split("---END---")[0].strip()
+    # Decode only the generated tokens so we never include prompt in response
+    generated_ids = outputs[0][prompt_length_tokens:]
+    raw_generated = tokenizer.decode(generated_ids, skip_special_tokens=True)
+    _write_desc_debug("desc_extract", prompt, prompt_length_tokens, raw_generated, len(generated_ids))
+    response = _parse_desc_json(raw_generated)
+    if response:
+        response = _strip_echoed_prompt_from_description(response, title)
+        return _truncate_description_to_one_sentence(response, max_chars=220)
+    # Fallback: non-JSON response (e.g. ---END--- style)
+    if "---END---" in raw_generated:
+        response = raw_generated.split("---END---")[0].strip()
     else:
-        response = text
-    if prompt in response:
-        response = response.split(prompt, 1)[1].strip()
-    elif len(response) > len(prompt):
-        response = response[len(prompt):].strip()
+        response = raw_generated.strip()
     response = response.replace("---END---", "").strip()
     response = _strip_echoed_prompt_from_description(response, title)
-    if len(response) > 220:
-        response = response[:217].rsplit(" ", 1)[0] + "..."
-    return response
+    return _truncate_description_to_one_sentence(response, max_chars=220)
+
+
+def _truncate_description_to_one_sentence(description: str, max_chars: int = 220) -> str:
+    """Prefer first sentence when description is long; otherwise truncate at word boundary."""
+    if not description or len(description) <= max_chars:
+        return description
+    # Prefer first sentence if it ends with . ! ? and is at least 30 chars
+    for end in (". ", "! ", "? "):
+        idx = description.find(end)
+        if idx >= 30:
+            candidate = description[: idx + 1].strip()
+            return candidate if len(candidate) <= max_chars else candidate[: max_chars - 3].rsplit(" ", 1)[0] + "..."
+    return description[: max_chars - 3].rsplit(" ", 1)[0] + "..."
 
 
 def _generate_description_with_llm(title: str, ingredients: str, instructions: str, model, tokenizer, device) -> str:
-    """Generate a short description using the LLM. Uses robust extraction so we get the model's answer even if tokenizer output doesn't match prompt exactly."""
+    """Generate a short description using the LLM. Strip by token count so we never include prompt in response."""
     prompt = _create_description_generation_prompt(title, ingredients, instructions)
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
+    prompt_length_tokens = inputs.input_ids.shape[1]
     with torch.no_grad():
         outputs = model.generate(**inputs, max_new_tokens=512, pad_token_id=tokenizer.eos_token_id)
-    text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    # Take content before ---END--- (model's answer); then strip prompt so we don't rely on exact len(prompt) match
-    if "---END---" in text:
-        response = text.split("---END---")[0].strip()
+    # Decode only the generated tokens (after prompt) so we never accidentally include prompt in response
+    generated_ids = outputs[0][prompt_length_tokens:]
+    raw_generated = tokenizer.decode(generated_ids, skip_special_tokens=True)
+    _write_desc_debug("desc_generate", prompt, prompt_length_tokens, raw_generated, len(generated_ids))
+    response = _parse_desc_json(raw_generated)
+    if response:
+        response = response.replace("**", "").replace("*", "")
+        return _truncate_description_to_one_sentence(response, max_chars=220)
+    # Fallback: non-JSON response
+    if "---END---" in raw_generated:
+        response = raw_generated.split("---END---")[0].strip()
     else:
-        response = text
-    if prompt in response:
-        response = response.split(prompt, 1)[1].strip()
-    else:
-        response = response[len(prompt):].strip() if len(response) > len(prompt) else response.strip()
-    response = response.replace("---END---", "").strip()
-    response = response.replace("**", "").replace("*", "")
-    if len(response) > 220:
-        response = response[:217].rsplit(" ", 1)[0] + "..."
-    print(f"[import-recipe] Generated description length: {len(response)}, preview: {response[:80]!r}...")
+        response = raw_generated.strip()
+    response = response.replace("---END---", "").strip().replace("**", "").replace("*", "")
+    response = _truncate_description_to_one_sentence(response, max_chars=220)
     return response if response else ""
 
 
@@ -648,13 +739,22 @@ def extract_recipe_with_llm(visible_text, model, tokenizer, device):
     data["instructions"] = instructions_str
     title_for_desc = (data.get("title") or "Recipe").strip() or "Recipe"
     
-    # Second call: description only
-    print(f"[import-recipe] Making second LLM call for description only...")
+    # Second call: description only. LLM figures out best description from page (any recipe site).
+    print(f"[import-recipe] Making second LLM call for description (extract or generate)...")
     description = _get_description_with_llm(visible_text, title_for_desc, ingredients_str, instructions_str, model, tokenizer, device)
-    if not description or _description_looks_like_dump(description):
-        print("[import-recipe] Description empty or dump; retrying with food-writer prompt...")
+    print(f"[import-recipe] Description from 2nd call: {description!r}")
+    is_dump = _description_looks_like_dump(description, title_for_desc)
+    if not description:
+        print("[import-recipe] Dump test: fail (empty)")
+    else:
+        print(f"[import-recipe] Dump test: {'fail (dump)' if is_dump else 'pass'}")
+    if not description or is_dump:
+        print("[import-recipe] Retrying with food-writer prompt (generate only, skip extract)...")
         description = _generate_description_with_llm(title_for_desc, ingredients_str, instructions_str, model, tokenizer, device)
-    if not description or _description_looks_like_dump(description):
+        print(f"[import-recipe] Description from food-writer call: {description!r}")
+        is_dump = _description_looks_like_dump(description, title_for_desc)
+        print(f"[import-recipe] Dump test after retry: {'fail (dump)' if is_dump else 'pass'}")
+    if not description or _description_looks_like_dump(description, title_for_desc):
         description = f"A classic {title_for_desc} recipe."
         print("[import-recipe] Using fallback description")
     if len(description) > 220:
@@ -789,7 +889,7 @@ async def import_recipe_from_url(url: str, model, tokenizer, device, progress: O
 
         # Sanitize or generate description: avoid using ingredients/instructions dump or empty
         description = (data.get("description") or "").strip()
-        if not description or _description_looks_like_dump(description):
+        if not description or _description_looks_like_dump(description, title_for_desc):
             print("[import-recipe] Description empty or dump; generating description with LLM...")
             try:
                 generated = await run_llm_in_thread(
@@ -801,7 +901,7 @@ async def import_recipe_from_url(url: str, model, tokenizer, device, progress: O
                     tokenizer,
                     device,
                 )
-                if generated and not _description_looks_like_dump(generated):
+                if generated and not _description_looks_like_dump(generated, title_for_desc):
                     description = generated
                     print(f"[import-recipe] Generated description ({len(description)} chars)")
                 else:

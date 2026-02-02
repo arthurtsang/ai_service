@@ -87,3 +87,4 @@ This module is deployed via:
 - `PYTORCH_CUDA_ALLOC_CONF`: CUDA memory allocation settings
 - `TRANSFORMERS_CACHE`: Hugging Face model cache directory
 - `HF_HOME`: Hugging Face home directory
+- `AI_SERVICE_MAX_MEMORY_GB`: Optional. Comma-separated per-GPU limits in GB when using multiple GPUs with different VRAM (e.g. `11,7` for 12GB + 8GB). Leave unset for single-GPU or equal cards.
