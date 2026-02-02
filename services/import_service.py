@@ -112,10 +112,11 @@ def clean_html_for_recipe_extraction(soup: BeautifulSoup) -> str:
         cleaned_text = '\n'.join(basic_cleaned_lines)
         cleaned_text = re.sub(r'\n\s*\n\s*\n', '\n\n', cleaned_text)
     
-    # Limit text length to speed up LLM processing
-    if len(cleaned_text) > 8000:
-        print(f"[import-recipe] Text too long ({len(cleaned_text)} chars), truncating to 8000 chars")
-        cleaned_text = cleaned_text[:8000] + "\n\n[Content truncated for processing speed]"
+    # Limit text length to reduce GPU memory (KV cache scales with prompt + max_new_tokens)
+    max_chars = 6000
+    if len(cleaned_text) > max_chars:
+        print(f"[import-recipe] Text too long ({len(cleaned_text)} chars), truncating to {max_chars} chars")
+        cleaned_text = cleaned_text[:max_chars] + "\n\n[Content truncated for processing]"
     
     print(f"[import-recipe] Cleaned text length: {len(cleaned_text)} characters")
     print(f"[import-recipe] First 500 chars of cleaned text: {cleaned_text[:500]}")
@@ -693,8 +694,11 @@ def extract_recipe_with_llm(visible_text, model, tokenizer, device):
     basic_inputs = tokenizer(basic_prompt, return_tensors="pt").to(device)
     
     with torch.no_grad():
-        basic_outputs = model.generate(**basic_inputs, max_new_tokens=4096, pad_token_id=tokenizer.eos_token_id)
+        basic_outputs = model.generate(**basic_inputs, max_new_tokens=2048, pad_token_id=tokenizer.eos_token_id)
     basic_text = tokenizer.decode(basic_outputs[0], skip_special_tokens=True)
+    del basic_inputs, basic_outputs
+    if getattr(device, "type", device) == "cuda":
+        torch.cuda.empty_cache()
     basic_response = basic_text[len(basic_prompt):].strip()
     
     print(f"[import-recipe] Basic info LLM call complete.")
@@ -718,9 +722,12 @@ def extract_recipe_with_llm(visible_text, model, tokenizer, device):
         markdown_prompt = create_markdown_extraction_prompt(visible_text)
         markdown_inputs = tokenizer(markdown_prompt, return_tensors="pt").to(device)
         with torch.no_grad():
-            markdown_outputs = model.generate(**markdown_inputs, max_new_tokens=4096, pad_token_id=tokenizer.eos_token_id)
+            markdown_outputs = model.generate(**markdown_inputs, max_new_tokens=2048, pad_token_id=tokenizer.eos_token_id)
         markdown_text = tokenizer.decode(markdown_outputs[0], skip_special_tokens=True)
         markdown_response = markdown_text[len(markdown_prompt):].strip().replace('---END---', '').strip()
+        del markdown_inputs, markdown_outputs
+        if getattr(device, "type", device) == "cuda":
+            torch.cuda.empty_cache()
         data = extract_json_from_markdown(markdown_response)
         print(f"[import-recipe] Extracted from markdown: {data}")
     
@@ -767,9 +774,12 @@ def extract_recipe_with_llm(visible_text, model, tokenizer, device):
     time_diff_inputs = tokenizer(time_diff_prompt, return_tensors="pt").to(device)
     
     with torch.no_grad():
-        time_diff_outputs = model.generate(**time_diff_inputs, max_new_tokens=2048, pad_token_id=tokenizer.eos_token_id)
+        time_diff_outputs = model.generate(**time_diff_inputs, max_new_tokens=1024, pad_token_id=tokenizer.eos_token_id)
     time_diff_text = tokenizer.decode(time_diff_outputs[0], skip_special_tokens=True)
     time_diff_response = time_diff_text[len(time_diff_prompt):].strip()
+    del time_diff_inputs, time_diff_outputs
+    if getattr(device, "type", device) == "cuda":
+        torch.cuda.empty_cache()
     
     print(f"[import-recipe] Cook time/difficulty LLM call complete.")
     print(f"[import-recipe] Time/diff response: {time_diff_response}")
@@ -788,6 +798,8 @@ def extract_recipe_with_llm(visible_text, model, tokenizer, device):
                 time_diff_data["cookTime"] = str(time_diff_data["cookTime"])
         data.update(time_diff_data)
     
+    if getattr(device, "type", device) == "cuda":
+        torch.cuda.empty_cache()
     return data
 
 
@@ -930,15 +942,5 @@ async def import_recipe_from_url(url: str, model, tokenizer, device, progress: O
         print(f"[import-recipe] Error: {e}")
         import traceback
         traceback.print_exc()
-        return ImportRecipeResponse(
-            title="Imported Recipe",
-            description=f"Error: {str(e)}",
-            ingredients="",
-            instructions="",
-            imageUrl="",
-            tags=["imported", "error"],
-            cookTime="Pending...",
-            difficulty="Undetermined",
-            timeReasoning="",
-            difficultyReasoning=""
-        ) 
+        # Re-raise so the API marks the job as failed (not completed with error in body)
+        raise 
