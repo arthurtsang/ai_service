@@ -39,7 +39,7 @@ def _parse_with_fallbacks(response_text, model, tokenizer, device):
 
 
 def _extract_balanced_json(response_text):
-    """Extract JSON by finding balanced braces to handle extra content after JSON."""
+    """Extract JSON by finding balanced braces, skipping braces inside double-quoted strings."""
     json_start = response_text.find('{')
     
     if json_start == -1:
@@ -48,8 +48,32 @@ def _extract_balanced_json(response_text):
     
     brace_count = 0
     json_end = json_start
-    
-    for i, char in enumerate(response_text[json_start:], json_start):
+    i = json_start
+    n = len(response_text)
+    in_string = False
+    escape_next = False
+    quote_char = None
+
+    while i < n:
+        char = response_text[i]
+        if escape_next:
+            escape_next = False
+            i += 1
+            continue
+        if char == '\\' and in_string:
+            escape_next = True
+            i += 1
+            continue
+        if in_string:
+            if char == quote_char:
+                in_string = False
+            i += 1
+            continue
+        if char == '"':
+            in_string = True
+            quote_char = '"'
+            i += 1
+            continue
         if char == '{':
             brace_count += 1
         elif char == '}':
@@ -57,8 +81,9 @@ def _extract_balanced_json(response_text):
             if brace_count == 0:
                 json_end = i
                 break
-    
-    if brace_count == 0:  # Found balanced JSON
+        i += 1
+
+    if brace_count == 0:
         json_str = response_text[json_start:json_end + 1]
         try:
             data = json.loads(json_str)
@@ -68,7 +93,7 @@ def _extract_balanced_json(response_text):
             print(f"[json-parser] Balanced JSON still invalid: {e}")
             return {}
     else:
-        print(f"[json-parser] Unbalanced braces in response")
+        print(f"[json-parser] Unbalanced braces in response (brace_count={brace_count})")
         return {}
 
 
@@ -87,7 +112,7 @@ def _llm_json_completion(response_text, model, tokenizer, device):
     with torch.no_grad():
         completion_outputs = model.generate(
             **completion_inputs, 
-            max_new_tokens=200, 
+            max_new_tokens=4096, 
             pad_token_id=tokenizer.eos_token_id
         )
     completion_text = tokenizer.decode(completion_outputs[0], skip_special_tokens=True)

@@ -6,11 +6,12 @@ import json
 import re
 import time
 import torch
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from bs4 import BeautifulSoup, Comment
 from playwright.async_api import async_playwright
 from pydantic import BaseModel
 from utils.json_parser import parse_llm_response, extract_json_from_markdown
+from utils.llm_thread import run_llm_in_thread
 
 
 class ImportRecipeRequest(BaseModel):
@@ -156,9 +157,9 @@ async def fetch_html_with_playwright(url: str) -> str:
                     print("[import-recipe] Network idle timeout, continuing anyway")
                     pass
             except Exception as e:
-                print(f"[import-recipe] Page load timeout, trying to get content anyway: {e}")
-                # If even domcontentloaded fails, try a basic load
-                await page.goto(url, wait_until="load", timeout=8000)
+                print(f"[import-recipe] Page load timeout, using current page content: {e}")
+                # Do not do a second goto (it often times out again). Use whatever content we have.
+                pass
             
             # Wait shorter for any lazy-loaded images and JavaScript to execute
             print("[import-recipe] Waiting for JavaScript and lazy-loaded images...")
@@ -366,24 +367,21 @@ def select_best_image(image_urls):
 
 
 def create_recipe_extraction_prompt(visible_text):
-    """Create the prompt for recipe extraction (basic info only)."""
+    """Create the prompt for recipe extraction: title, ingredients, instructions only (no description)."""
     return (
         "Extract basic recipe information from the provided web page text. "
         "Return a JSON object with the following structure:\n"
         "{\n"
         '  "title": "Recipe title",\n'
-        '  "description": "Brief description or summary",\n'
-        '  "ingredients": ["ingredient 1", "ingredient 2", ...],\n'
-        '  "instructions": ["step 1", "step 2", ...]\n'
+        '  "ingredients": "markdown string or array of ingredients",\n'
+        '  "instructions": "markdown string or array of steps"\n'
         "}\n\n"
         "Guidelines:\n"
         "- **Title**: Use the most prominent or repeated recipe title.\n"
-        "- **Description**: Extract the first sentence or paragraph summarizing the recipe, verbatim if possible.\n"
-        "- **Ingredients**: Capture each ingredient exactly as listed, including quantities, units, and optional phrases (e.g., '1 cup sugar, or more to taste').\n"
-        "- **Instructions**: List instructions as numbered steps, preserving original wording and order.\n"
-        "- **General**:\n"
-        "  - If data is repeated, use the first clear instance.\n"
-        "  - End with '---END---' to indicate completion.\n\n"
+        "- **Ingredients**: Use markdown: bullet list (- item), headers (## Section), or plain lines. Preserve structure. Can be a string or array; if array, we will join.\n"
+        "- **Instructions**: Use markdown: numbered steps (1. ...), headers (## For Pound Cake:), bullet points. Preserve sections like 'For Cupcakes:', 'Moisture Concerns:'. Can be a string or array.\n"
+        "- Do NOT include a description field.\n"
+        "- If data is repeated, use the first clear instance. End with '---END---'.\n\n"
         f"Page text:\n{visible_text}\n\n"
         "JSON:"
     )
@@ -466,12 +464,140 @@ def create_markdown_extraction_prompt(visible_text):
     )
 
 
+def _description_looks_like_dump(description: str) -> bool:
+    """True if description is ingredients/instructions pasted, image caption, or echoed prompt label (not a real summary)."""
+    if not description:
+        return False
+    d = description.strip()
+    dl = d.lower()
+    # Only treat as dump when description *starts with* "Example:" or "Example " (prompt label). Do not flag "example" mid-sentence.
+    if dl.startswith("example:") or dl.startswith("example "):
+        return True
+    if dl.startswith("image:") or (dl.startswith("image ") and ("/" in d or "upload" in dl)):
+        return True
+    if len(d) < 50:
+        return False
+    if "ingredients" in dl and "instructions" in dl:
+        return True
+    if dl.startswith("ingredients:") or dl.startswith("ingredients\n") or (len(dl) >= 20 and dl[:20].startswith("ingredients")):
+        return True
+    if len(d) > 400 and ("1." in d and "2." in d) and d.count("\n") > 6:
+        return True
+    return False
+
+
+def create_description_extraction_prompt(visible_text: str, title: str, ingredients_excerpt: str, instructions_excerpt: str) -> str:
+    """Prompt for description only: extract from page or write one from context. No labels to echo."""
+    return (
+        "From the page text below, output a single short appetizing sentence that describes this recipe. "
+        "If the page has a summary or intro sentence, use that (shortened to under 220 characters). "
+        "If not, write one sentence from the recipe name and context. "
+        "Do not output labels, headings, or the word 'Recipe'. Do not list ingredients or instructions. "
+        "Example good output: A classic buttery pound cake with a tender crumb.\n\n"
+        f"Recipe name: {title}\n\n"
+        "Page text (excerpt):\n"
+        f"{visible_text[:4000]}\n\n"
+        "Output only that one sentence, then '---END---'."
+    )
+
+
+def _strip_echoed_prompt_from_description(description: str, title: str) -> str:
+    """Remove common prompt labels if the model echoed them; return first line that looks like a real description."""
+    if not description or not description.strip():
+        return ""
+    d = description.strip()
+    # Strip common echoed prefixes
+    for prefix in (
+        "Recipe title:", "Recipe context", "Ingredients (excerpt):", "Instructions (excerpt):",
+        "Image:", "Example:", "Example good output:", "Description:",
+    ):
+        if d.lower().startswith(prefix.lower()):
+            d = d[len(prefix):].strip()
+            break
+    lines = [ln.strip() for ln in d.split("\n") if ln.strip()]
+    for line in lines:
+        if 20 <= len(line) <= 250:
+            if line.lower().startswith(("recipe title", "ingredients", "instructions", "image:", "example")):
+                continue
+            if line.startswith("- ") or (len(line) > 2 and line[0].isdigit() and line[1] in ".)"):
+                continue
+            if title and line.strip().lower() == title.strip().lower():
+                continue
+            return line.strip()
+    return d[:220].strip() if d else ""
+
+
+def _create_description_generation_prompt(title: str, ingredients: str, instructions: str) -> str:
+    """Prompt for LLM to generate a short appetizing description (~200 chars)."""
+    return (
+        "You are an expert food writer. Write a SHORT appetizing description for this recipe.\n\n"
+        f"Recipe Title: {title}\n\n"
+        "Ingredients (excerpt):\n"
+        f"{ingredients[:1500]}\n\n"
+        "Instructions (excerpt):\n"
+        f"{instructions[:1500]}\n\n"
+        "Write ONE or TWO short sentences (around 200 characters total) that capture the essence of this dish. "
+        "Mention key flavors or meal type. No bullet points, no formatting.\n\n"
+        "IMPORTANT: Keep it under 220 characters. End your response with '---END---'."
+    )
+
+
+def _get_description_with_llm(visible_text: str, title: str, ingredients_str: str, instructions_str: str, model, tokenizer, device) -> str:
+    """Second call: description only. Returns stripped description, max 220 chars."""
+    prompt = create_description_extraction_prompt(
+        visible_text, title,
+        ingredients_str[:500], instructions_str[:500]
+    )
+    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+    with torch.no_grad():
+        outputs = model.generate(**inputs, max_new_tokens=256, pad_token_id=tokenizer.eos_token_id)
+    text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    if "---END---" in text:
+        response = text.split("---END---")[0].strip()
+    else:
+        response = text
+    if prompt in response:
+        response = response.split(prompt, 1)[1].strip()
+    elif len(response) > len(prompt):
+        response = response[len(prompt):].strip()
+    response = response.replace("---END---", "").strip()
+    response = _strip_echoed_prompt_from_description(response, title)
+    if len(response) > 220:
+        response = response[:217].rsplit(" ", 1)[0] + "..."
+    return response
+
+
+def _generate_description_with_llm(title: str, ingredients: str, instructions: str, model, tokenizer, device) -> str:
+    """Generate a short description using the LLM. Uses robust extraction so we get the model's answer even if tokenizer output doesn't match prompt exactly."""
+    prompt = _create_description_generation_prompt(title, ingredients, instructions)
+    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+    with torch.no_grad():
+        outputs = model.generate(**inputs, max_new_tokens=512, pad_token_id=tokenizer.eos_token_id)
+    text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    # Take content before ---END--- (model's answer); then strip prompt so we don't rely on exact len(prompt) match
+    if "---END---" in text:
+        response = text.split("---END---")[0].strip()
+    else:
+        response = text
+    if prompt in response:
+        response = response.split(prompt, 1)[1].strip()
+    else:
+        response = response[len(prompt):].strip() if len(response) > len(prompt) else response.strip()
+    response = response.replace("---END---", "").strip()
+    response = response.replace("**", "").replace("*", "")
+    if len(response) > 220:
+        response = response[:217].rsplit(" ", 1)[0] + "..."
+    print(f"[import-recipe] Generated description length: {len(response)}, preview: {response[:80]!r}...")
+    return response if response else ""
+
+
 def extract_recipe_with_llm(visible_text, model, tokenizer, device):
-    """Extract recipe data using LLM with two separate calls for better focus."""
+    """Extract recipe data using LLM: (1) title/ingredients/instructions, (2) description only, (3) cook time/difficulty."""
+    import os
     print(f"[import-recipe] Sending prompts to LLM (length: {len(visible_text) + 600})")
     
-    # First call: Extract basic recipe information (title, description, ingredients, instructions)
-    print(f"[import-recipe] Making first LLM call for basic recipe info...")
+    # First call: title, ingredients, instructions only (no description)
+    print(f"[import-recipe] Making first LLM call for title, ingredients, instructions...")
     basic_prompt = create_recipe_extraction_prompt(visible_text)
     basic_inputs = tokenizer(basic_prompt, return_tensors="pt").to(device)
     
@@ -484,35 +610,59 @@ def extract_recipe_with_llm(visible_text, model, tokenizer, device):
     print(f"[import-recipe] Basic response length: {len(basic_response)}")
     print(f"[import-recipe] Basic response (first 500 chars): {basic_response[:500]}")
     
-    # Remove ---END--- marker before parsing
     basic_response = basic_response.replace('---END---', '').strip()
-    
-    # Parse the basic JSON response
     data = parse_llm_response(basic_response, model, tokenizer, device)
     
-    # If basic JSON parsing failed completely, try markdown extraction
     if not data or (not data.get("title") and not data.get("ingredients") and not data.get("instructions")):
+        debug_dir = "/tmp/recipe_debug"
+        os.makedirs(debug_dir, exist_ok=True)
+        debug_file = os.path.join(debug_dir, f"llm_basic_response_{int(time.time())}.txt")
+        try:
+            with open(debug_file, "w", encoding="utf-8") as f:
+                f.write(basic_response)
+            print(f"[import-recipe] Raw basic LLM response saved to: {debug_file}")
+        except Exception as e:
+            print(f"[import-recipe] Could not save debug file: {e}")
         print(f"[import-recipe] Basic JSON parsing failed, attempting markdown extraction...")
-        
         markdown_prompt = create_markdown_extraction_prompt(visible_text)
         markdown_inputs = tokenizer(markdown_prompt, return_tensors="pt").to(device)
-        
         with torch.no_grad():
             markdown_outputs = model.generate(**markdown_inputs, max_new_tokens=4096, pad_token_id=tokenizer.eos_token_id)
         markdown_text = tokenizer.decode(markdown_outputs[0], skip_special_tokens=True)
-        markdown_response = markdown_text[len(markdown_prompt):].strip()
-        
-        print(f"[import-recipe] Markdown response: {markdown_response}")
-        
-        # Remove ---END--- marker before parsing
-        markdown_response = markdown_response.replace('---END---', '').strip()
-        
-        # Parse markdown sections
+        markdown_response = markdown_text[len(markdown_prompt):].strip().replace('---END---', '').strip()
         data = extract_json_from_markdown(markdown_response)
         print(f"[import-recipe] Extracted from markdown: {data}")
     
-    # Second call: Extract cook time and difficulty only
-    print(f"[import-recipe] Making second LLM call for cook time and difficulty...")
+    # Normalize ingredients/instructions: list -> markdown string
+    raw_ing = data.get("ingredients")
+    raw_instr = data.get("instructions")
+    if isinstance(raw_ing, list):
+        ingredients_str = "\n".join(str(x).strip() for x in raw_ing if x)
+    else:
+        ingredients_str = str(raw_ing or "").strip()
+    if isinstance(raw_instr, list):
+        instructions_str = "\n".join(str(x).strip() for x in raw_instr if x)
+    else:
+        instructions_str = str(raw_instr or "").strip()
+    data["ingredients"] = ingredients_str
+    data["instructions"] = instructions_str
+    title_for_desc = (data.get("title") or "Recipe").strip() or "Recipe"
+    
+    # Second call: description only
+    print(f"[import-recipe] Making second LLM call for description only...")
+    description = _get_description_with_llm(visible_text, title_for_desc, ingredients_str, instructions_str, model, tokenizer, device)
+    if not description or _description_looks_like_dump(description):
+        print("[import-recipe] Description empty or dump; retrying with food-writer prompt...")
+        description = _generate_description_with_llm(title_for_desc, ingredients_str, instructions_str, model, tokenizer, device)
+    if not description or _description_looks_like_dump(description):
+        description = f"A classic {title_for_desc} recipe."
+        print("[import-recipe] Using fallback description")
+    if len(description) > 220:
+        description = description[:217].rsplit(" ", 1)[0] + "..."
+    data["description"] = description
+    
+    # Third call: cook time and difficulty
+    print(f"[import-recipe] Making third LLM call for cook time and difficulty...")
     time_diff_prompt = create_cook_time_difficulty_prompt(visible_text)
     time_diff_inputs = tokenizer(time_diff_prompt, return_tensors="pt").to(device)
     
@@ -541,8 +691,8 @@ def extract_recipe_with_llm(visible_text, model, tokenizer, device):
     return data
 
 
-async def import_recipe_from_url(url: str, model, tokenizer, device) -> ImportRecipeResponse:
-    """Import recipe from a given URL."""
+async def import_recipe_from_url(url: str, model, tokenizer, device, progress: Optional[Dict[str, Any]] = None) -> ImportRecipeResponse:
+    """Import recipe from a given URL. Updates progress['step'] and progress['updated_at'] if progress is provided."""
     try:
         print(f"[import-recipe] Fetching URL: {url}")
         html = await fetch_html_with_playwright(url)
@@ -575,9 +725,9 @@ async def import_recipe_from_url(url: str, model, tokenizer, device) -> ImportRe
             f.write(visible_text)
         print(f"[import-recipe] Cleaned text saved to: {debug_file}")
 
-        # Extract recipe data using LLM
-        data = extract_recipe_with_llm(visible_text, model, tokenizer, device)
-        
+        # Extract recipe data using LLM (run in thread so event loop can serve status polls)
+        data = await run_llm_in_thread(extract_recipe_with_llm, visible_text, model, tokenizer, device)
+
         # Always prioritize our found images over LLM hallucination
         best_image = ""
         if image_urls:
@@ -629,12 +779,45 @@ async def import_recipe_from_url(url: str, model, tokenizer, device) -> ImportRe
             cook_time = str(cook_time)
             
         difficulty_reasoning = "Imported from recipe" if difficulty and difficulty != "Undetermined" else ""
-        
+
+        # Normalize ingredients/instructions to strings
+        raw_ing = data.get("ingredients")
+        raw_instr = data.get("instructions")
+        ingredients_str = "\n".join(str(x).strip() for x in raw_ing) if isinstance(raw_ing, list) else str(raw_ing or "")
+        instructions_str = "\n".join(str(x).strip() for x in raw_instr) if isinstance(raw_instr, list) else str(raw_instr or "")
+        title_for_desc = (data.get("title") or "Recipe").strip() or "Recipe"
+
+        # Sanitize or generate description: avoid using ingredients/instructions dump or empty
+        description = (data.get("description") or "").strip()
+        if not description or _description_looks_like_dump(description):
+            print("[import-recipe] Description empty or dump; generating description with LLM...")
+            try:
+                generated = await run_llm_in_thread(
+                    _generate_description_with_llm,
+                    title_for_desc,
+                    ingredients_str,
+                    instructions_str,
+                    model,
+                    tokenizer,
+                    device,
+                )
+                if generated and not _description_looks_like_dump(generated):
+                    description = generated
+                    print(f"[import-recipe] Generated description ({len(description)} chars)")
+                else:
+                    description = f"A classic {title_for_desc} recipe."
+                    print("[import-recipe] Generation empty or still dump; using fallback description")
+            except Exception as e:
+                print(f"[import-recipe] Description generation failed: {e}, using fallback")
+                description = f"A classic {title_for_desc} recipe."
+        if len(description) > 220:
+            description = description[:217].rsplit(" ", 1)[0] + "..."
+
         return ImportRecipeResponse(
             title=data.get("title", "Imported Recipe"),
-            description=data.get("description", ""),
-            ingredients="\n".join(data.get("ingredients", [])) if isinstance(data.get("ingredients"), list) else str(data.get("ingredients", "")),
-            instructions="\n".join(data.get("instructions", [])) if isinstance(data.get("instructions"), list) else str(data.get("instructions", "")),
+            description=description,
+            ingredients=ingredients_str,
+            instructions=instructions_str,
             imageUrl=data.get("imageUrl", ""),
             tags=["imported"],
             cookTime=cook_time or "Pending...",

@@ -13,6 +13,7 @@ import os
 # Add the parent directory to the path to import utils
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils.json_parser import extract_json_from_markdown
+from utils.llm_thread import run_llm_in_thread
 
 logger = logging.getLogger(__name__)
 
@@ -238,47 +239,35 @@ Generate the optimal tournament schedule now:"""
 
         return prompt
     
+    def _get_llm_response_sync(self, prompt: str) -> str:
+        """Sync LLM generate (run via run_llm_in_thread so event loop stays responsive)."""
+        import torch
+        inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=4000)
+        if hasattr(self.model, 'device'):
+            inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
+        with torch.no_grad():
+            outputs = self.model.generate(
+                inputs["input_ids"],
+                max_new_tokens=2000,
+                temperature=0.1,
+                do_sample=True,
+                pad_token_id=self.tokenizer.eos_token_id
+            )
+        response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+        if prompt in response:
+            response = response.split(prompt)[-1].strip()
+        self.logger.info(f"LLM generated response: {response[:500]}...")
+        return response
+
     async def _get_llm_response(self, prompt: str) -> str:
-        """Get response from the LLM model"""
+        """Get response from the LLM model (runs generate in a thread)."""
         try:
             if self.model is None or self.tokenizer is None:
-                # Mock response for testing when model is not available
                 self.logger.warning("LLM model not available, returning mock response")
                 return self._get_mock_response()
-            
-            # Import torch here to avoid issues if not available
-            import torch
-            
-            # Tokenize the input
-            inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=4000)
-            
-            # Move inputs to the same device as the model
-            if hasattr(self.model, 'device'):
-                inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
-            
-            # Generate response
-            with torch.no_grad():
-                outputs = self.model.generate(
-                    inputs["input_ids"],
-                    max_new_tokens=2000,
-                    temperature=0.1,
-                    do_sample=True,
-                    pad_token_id=self.tokenizer.eos_token_id
-                )
-            
-            # Decode the response
-            response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-            
-            # Extract only the generated part (remove the prompt)
-            if prompt in response:
-                response = response.split(prompt)[-1].strip()
-            
-            self.logger.info(f"LLM generated response: {response[:500]}...")
-            return response
-            
+            return await run_llm_in_thread(self._get_llm_response_sync, prompt)
         except Exception as e:
             self.logger.error(f"Error getting LLM response: {str(e)}")
-            # Return mock response on error
             return self._get_mock_response()
     
     def _get_mock_response(self) -> str:

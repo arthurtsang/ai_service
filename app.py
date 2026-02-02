@@ -3,7 +3,7 @@ AI Service FastAPI Application
 Provides AI-powered services including recipe analysis and tournament scheduling
 """
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 import logging
 import uvicorn
@@ -72,13 +72,19 @@ async def legacy_analyze_recipe(request):
     return await recipe_router.routes[0].endpoint(request)
 
 @app.post("/import-recipe")
-async def legacy_import_recipe(request):
-    """Legacy endpoint - redirects to new recipe API"""
-    from fastapi import Request
-    from fastapi.responses import RedirectResponse
-    
-    # This will be handled by the recipe router
-    return await recipe_router.routes[1].endpoint(request)
+async def legacy_import_recipe(request: Request):
+    """Legacy endpoint - start async import, return jobId. Poll GET /import-recipe/status/{jobId} for result."""
+    body = await request.json()
+    from api.recipe_api import ImportRecipeRequest
+    parsed = ImportRecipeRequest(**body)
+    return await recipe_router.routes[1].endpoint(parsed)
+
+
+@app.get("/import-recipe/status/{job_id}")
+async def legacy_import_status(job_id: str):
+    """Legacy endpoint - get import job status (pending|processing|completed|failed)."""
+    from api.recipe_api import get_import_status
+    return await get_import_status(job_id)
 
 @app.post("/auto-category")
 async def legacy_auto_category(request):

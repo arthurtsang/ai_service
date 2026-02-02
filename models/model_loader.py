@@ -1,6 +1,11 @@
 """
 Model loading and initialization for the AI service.
+
+Multi-GPU: device_map="auto" (Accelerate) shards the model across all visible
+CUDA devices. With 2 GPUs (e.g. 12GB + 8GB), the model is split automatically.
+Optional max_memory balances load when cards have different VRAM.
 """
+import os
 import torch
 import psutil
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
@@ -11,6 +16,22 @@ def get_device():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
     return device
+
+
+def get_max_memory():
+    """
+    Optional per-GPU memory limits for device_map="auto" when using multiple
+    GPUs with different VRAM (e.g. 12GB + 8GB). Leave some headroom per device.
+    Set AI_SERVICE_MAX_MEMORY_GB="11,7" to use 11GB on GPU0 and 7GB on GPU1.
+    """
+    spec = os.environ.get("AI_SERVICE_MAX_MEMORY_GB")
+    if not spec or not torch.cuda.is_available():
+        return None
+    try:
+        parts = [p.strip() for p in spec.split(",")]
+        return {i: f"{int(p)}GiB" for i, p in enumerate(parts)}
+    except (ValueError, IndexError):
+        return None
 
 
 def create_quantization_config():
@@ -43,10 +64,14 @@ def load_model_and_tokenizer():
         
         print(f"Loading model from {model_name} with quantization...")
         print(f"Quantization config: {quantization_config}")
+        max_memory = get_max_memory()
+        if max_memory:
+            print(f"Multi-GPU max_memory: {max_memory}")
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
             quantization_config=quantization_config,
             device_map="auto",
+            max_memory=max_memory,
             torch_dtype=torch.float16,
             low_cpu_mem_usage=True,
             trust_remote_code=True
@@ -93,10 +118,12 @@ def _load_fallback_model(quantization_config, model_name):
     print("Tokenizer loaded successfully")
     
     print(f"Loading model from {model_name} with quantization...")
+    max_memory = get_max_memory()
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         quantization_config=quantization_config,
         device_map="auto",
+        max_memory=max_memory,
         torch_dtype=torch.float16,
         low_cpu_mem_usage=True,
     )

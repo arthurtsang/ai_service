@@ -6,6 +6,7 @@ from pydantic import BaseModel
 from typing import List, Any
 import re
 from utils.recipe_api import fetch_relevant_recipes
+from utils.llm_thread import run_llm_in_thread
 
 
 class ChatRequest(BaseModel):
@@ -107,8 +108,10 @@ async def process_chat_request(request: ChatRequest, model, tokenizer, device) -
         # Retrieve relevant recipes (if any)
         recipes = await retrieve_relevant_recipes(request.question)
         
-        # Generate response
-        answer = generate_chat_response(request.question, model, tokenizer, device)
+        # Generate response (run in thread so event loop stays responsive)
+        answer = await run_llm_in_thread(
+            generate_chat_response, request.question, model, tokenizer, device
+        )
         
         # If we found recipes, enhance the response to mention them
         if recipes:

@@ -3,7 +3,11 @@ Recipe API endpoints for AI Service
 Handles recipe analysis, import, categorization, and chat
 """
 
-from fastapi import APIRouter, HTTPException, Request, Depends
+import asyncio
+import inspect
+import uuid
+import time
+from fastapi import APIRouter, HTTPException, Request, Depends, Body
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from typing import Dict, Any, Optional
@@ -15,6 +19,9 @@ from services.import_service import import_recipe_from_url, ImportRecipeRequest,
 from services.chat_service import generate_chat_response, ChatRequest, ChatResponse
 
 logger = logging.getLogger(__name__)
+
+# In-memory store for async import jobs: job_id -> { status, url, result?, error?, created_at, started_at?, step?, updated_at? }
+_import_jobs: Dict[str, Dict[str, Any]] = {}
 
 # Create router for recipe endpoints
 router = APIRouter(prefix="/recipe", tags=["recipe"])
@@ -104,26 +111,77 @@ async def analyze_recipe(request: RecipeAnalysisRequest):
         logger.error(f"Error analyzing recipe: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Recipe analysis failed: {str(e)}")
 
-@router.post("/import", dependencies=[Depends(verify_internal_access)])
-async def import_recipe(request: ImportRecipeRequest):
-    """
-    Import a recipe from an external URL
-    This endpoint is only accessible from internal services (localhost) or with a valid API key.
-    """
+async def _run_import_job(job_id: str, url: str) -> None:
+    """Background task: run import and update job state."""
+    global _import_jobs
+    job = _import_jobs.get(job_id)
+    if not job:
+        return
     try:
-        logger.info(f"Importing recipe from: {request.url}")
-        
-        if model is None or tokenizer is None:
-            raise HTTPException(status_code=503, detail="Model not initialized")
-        
-        # Import the recipe using the existing function
-        imported_data = await import_recipe_from_url(request.url, model, tokenizer, device)
-        
-        return imported_data
-        
+        job["status"] = "processing"
+        job["started_at"] = time.time()
+        job["step"] = "starting"
+        job["updated_at"] = time.time()
+        logger.info(f"[import] Job {job_id} processing URL: {url}")
+        sig = inspect.signature(import_recipe_from_url)
+        if "progress" in sig.parameters:
+            result = await import_recipe_from_url(url, model, tokenizer, device, progress=job)
+        else:
+            result = await import_recipe_from_url(url, model, tokenizer, device)
+        job["status"] = "completed"
+        job["step"] = "completed"
+        job["updated_at"] = time.time()
+        job["result"] = result.model_dump() if hasattr(result, "model_dump") else result.dict()
+        logger.info(f"[import] Job {job_id} completed (title: {result.title[:50]!r}...)")
     except Exception as e:
-        logger.error(f"Error importing recipe: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Recipe import failed: {str(e)}")
+        logger.error(f"[import] Job {job_id} failed: {str(e)}", exc_info=True)
+        job["status"] = "failed"
+        job["step"] = "failed"
+        job["updated_at"] = time.time()
+        job["error"] = str(e)
+
+
+@router.post("/import", dependencies=[Depends(verify_internal_access)])
+async def import_recipe(body: ImportRecipeRequest = Body(...)):
+    """
+    Start an async import from an external URL. Returns jobId immediately.
+    Poll GET /recipe/import/status/{jobId} for status and result.
+    """
+    if model is None or tokenizer is None:
+        raise HTTPException(status_code=503, detail="Model not initialized")
+    job_id = str(uuid.uuid4())
+    _import_jobs[job_id] = {
+        "status": "pending",
+        "url": body.url,
+        "created_at": time.time(),
+        "step": "pending",
+    }
+    asyncio.create_task(_run_import_job(job_id, body.url))
+    logger.info(f"[import] Started job {job_id} for URL: {body.url}")
+    return {"jobId": job_id, "status": "pending"}
+
+
+@router.get("/import/status/{job_id}", dependencies=[Depends(verify_internal_access)])
+async def get_import_status(job_id: str):
+    """Get status of an import job. Returns status, step, timestamps, and result/error when done."""
+    if job_id not in _import_jobs:
+        raise HTTPException(status_code=404, detail="Import job not found")
+    job = _import_jobs[job_id]
+    out = {
+        "status": job["status"],
+        "url": job.get("url"),
+        "step": job.get("step", "unknown"),
+        "created_at": job.get("created_at"),
+        "started_at": job.get("started_at"),
+        "updated_at": job.get("updated_at"),
+    }
+    if job.get("started_at") and job.get("updated_at"):
+        out["elapsed_seconds"] = round(job["updated_at"] - job["started_at"], 1)
+    if job.get("result") is not None:
+        out["result"] = job["result"]
+    if job.get("error") is not None:
+        out["error"] = job["error"]
+    return out
 
 @router.post("/auto-category")
 async def auto_category(request: AutoCategoryRequest):

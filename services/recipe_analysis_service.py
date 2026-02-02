@@ -7,6 +7,7 @@ import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils.json_parser import extract_json_from_markdown
+from utils.llm_thread import run_llm_in_thread
 
 class RecipeAnalysisService:
     def __init__(self, model, tokenizer):
@@ -162,37 +163,29 @@ IMPORTANT: End your response with '---END---' to indicate completion:"""
 
         return prompt
 
+    def _get_llm_response_sync(self, prompt: str) -> str:
+        """Sync LLM generate (run via run_llm_in_thread so event loop stays responsive)."""
+        # Tokenize the input
+        inputs = self.tokenizer(prompt, return_tensors="pt", max_length=2048, truncation=True)
+        device = next(self.model.parameters()).device
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        with torch.no_grad():
+            outputs = self.model.generate(
+                inputs['input_ids'],
+                max_new_tokens=2048,
+                temperature=0.3,
+                do_sample=True,
+                pad_token_id=self.tokenizer.eos_token_id
+            )
+        response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+        response = response[len(prompt):].strip()
+        print(f"[recipe-analysis] LLM Response: {response}")
+        return response
+
     async def _get_llm_response(self, prompt: str) -> str:
-        """
-        Get response from the LLM model.
-        """
+        """Get response from the LLM model (runs generate in a thread)."""
         try:
-            # Tokenize the input
-            inputs = self.tokenizer(prompt, return_tensors="pt", max_length=2048, truncation=True)
-            
-            # Move inputs to the same device as the model
-            device = next(self.model.parameters()).device
-            inputs = {k: v.to(device) for k, v in inputs.items()}
-            
-            # Generate response
-            with torch.no_grad():
-                outputs = self.model.generate(
-                    inputs['input_ids'],
-                    max_new_tokens=2048,
-                    temperature=0.3,
-                    do_sample=True,
-                    pad_token_id=self.tokenizer.eos_token_id
-                )
-            
-            # Decode the response
-            response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-            
-            # Extract only the generated part (after the prompt)
-            response = response[len(prompt):].strip()
-            
-            print(f"[recipe-analysis] LLM Response: {response}")
-            return response
-            
+            return await run_llm_in_thread(self._get_llm_response_sync, prompt)
         except Exception as e:
             print(f"[recipe-analysis] Error getting LLM response: {e}")
             raise
