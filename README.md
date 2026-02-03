@@ -25,6 +25,20 @@ ai_service/
 └── .venv/              # Python virtual environment
 ```
 
+## Dependencies (yt-dlp)
+
+Video recipe import uses **yt-dlp** to fetch metadata, subtitles, thumbnails, and comments. It is declared in `pyproject.toml` as `yt-dlp (>=2024.1.0)`.
+
+- **Where it runs from**: The systemd service sets `PATH=.venv/bin:...`. If `yt-dlp` is installed in the project venv (`.venv/bin/yt-dlp`), that is used; otherwise the system binary (e.g. `/usr/local/bin/yt-dlp`) is used.
+- **If another agent installed it**: If `yt-dlp` is not in `.venv/bin`, it was likely installed system-wide (e.g. `pip install yt-dlp`, `sudo apt`, or another script). To use the **project’s** version, install deps into the venv: from the project root run `poetry lock` (to resolve yt-dlp into the lockfile if needed) and `poetry install`. Then restart the service.
+- **Comment limit**: yt-dlp has no global `--max-comments` flag. The code uses `--extractor-args "youtube:max-comments=100"` to limit YouTube comments; other sites use default behavior.
+
+To see which binary and version the service uses:
+```bash
+PATH=/home/tsangc1/Projects/ai_service/.venv/bin:/usr/local/bin:/usr/bin:/bin which yt-dlp
+PATH=/home/tsangc1/Projects/ai_service/.venv/bin:/usr/local/bin:/usr/bin:/bin yt-dlp --version
+```
+
 ## Installation
 
 ### Quick Install (as root)

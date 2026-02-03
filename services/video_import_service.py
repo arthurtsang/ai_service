@@ -67,14 +67,106 @@ def _transcribe_audio_with_whisper(audio_path: Path, language: Optional[str] = N
 
 # Directory for thumbnails returned to recipe backend (local path in imageUrl)
 THUMBNAIL_TMP_DIR = Path("/tmp/ai-service-thumbnails")
+# Debug: save video metadata + LLM response for review
+RECIPE_DEBUG_DIR = Path("/tmp/recipe_debug")
+
+# Device for video import LLM: "cpu" or "cuda". Default cuda; use LLM_INFERENCE_LOCK so only one LLM runs at a time.
+VIDEO_IMPORT_DEVICE = (os.getenv("VIDEO_IMPORT_DEVICE", "cuda") or "cuda").strip().lower()
+if VIDEO_IMPORT_DEVICE not in ("cpu", "cuda"):
+    VIDEO_IMPORT_DEVICE = "cuda"
 
 
-def _download_video_content(url: str, work_dir: Path) -> Tuple[str, str, str, Optional[Path]]:
+def _save_recipe_debug(
+    job_id: str,
+    url: str,
+    video_metadata: Dict[str, Any],
+    llm_response: Dict[str, Any],
+    final_output: Dict[str, Any],
+) -> None:
+    """Write debug JSON to /tmp/recipe_debug for review (video metadata + LLM output + final)."""
+    try:
+        RECIPE_DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "job_id": job_id,
+            "url": url,
+            "video_metadata": video_metadata,
+            "llm_response": llm_response,
+            "final_output": final_output,
+        }
+        path_one = RECIPE_DEBUG_DIR / f"{job_id}.json"
+        path_latest = RECIPE_DEBUG_DIR / "latest.json"
+        for p in (path_one, path_latest):
+            p.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        logger.info("[video-import] Debug saved to %s and %s", path_one, path_latest)
+    except Exception as e:
+        logger.warning("[video-import] Failed to save recipe debug: %s", e)
+
+
+def _video_title_and_description(
+    video_title: str, llm_title: str, llm_description: str
+) -> Tuple[str, str]:
     """
-    Use yt-dlp to download description, subtitle (or audio for transcription), and thumbnail.
-    Returns (title, description, transcript, thumbnail_path or None).
+    Prefer a real recipe title over generic video title (e.g. 'Video by username').
+    If LLM put the dish name in description (short string), use it as title.
     """
-    # Download metadata + subtitles + thumbnail; if no subs, download audio
+    title = (llm_title or "").strip()
+    desc = (llm_description or "").strip()
+    # Treat as generic: empty, or starts with "Video by"/"Untitled", or contains "Video by" (LLM sometimes echoes video title)
+    generic_title = (
+        not title
+        or re.match(r"^(Video by|Untitled)", title, re.I)
+        or re.search(r"Video by\s", title, re.I)
+    )
+    if generic_title and desc and len(desc) <= 120 and "\n" not in desc:
+        logger.info("[video-import] Title from short description: video_title=%r llm_title=%r -> %r", video_title, llm_title, desc[:60])
+        return desc, ""
+    if generic_title and desc:
+        # Use first sentence or first 80 chars of description as title instead of "Video by ..."
+        first_line = desc.split("\n")[0].strip()
+        if "." in first_line:
+            candidate = first_line.split(".")[0].strip() + "."
+        else:
+            candidate = first_line[:80].rsplit(" ", 1)[0] if len(first_line) > 80 else first_line
+        if candidate and len(candidate) > 2:
+            logger.info("[video-import] Title from description first line: video_title=%r llm_title=%r -> %r", video_title, llm_title, candidate[:60])
+            return candidate, desc
+    if generic_title and not desc:
+        logger.warning("[video-import] Keeping generic video title (no usable LLM title/desc): video_title=%r llm_title=%r", video_title, llm_title)
+        return video_title or title or "Untitled", ""
+    logger.info("[video-import] Using LLM title: video_title=%r llm_title=%r", video_title, title[:60] if title else "")
+    return title or video_title or "Untitled", desc
+
+
+def _comments_from_same_user(comments: List[Dict[str, Any]], max_count: int = 2) -> List[Dict[str, Any]]:
+    """
+    Return up to max_count comments from the same user. Prefer uploader's comments;
+    otherwise use the first comment's author and take up to max_count from that author.
+    """
+    if not comments or max_count <= 0:
+        return []
+    # Prefer uploader (often the recipe poster)
+    uploader_comments = [c for c in comments if c.get("author_is_uploader")][:max_count]
+    if len(uploader_comments) >= max_count:
+        return uploader_comments
+    if uploader_comments:
+        author_id = uploader_comments[0].get("author_id")
+        same_author = [c for c in comments if c.get("author_id") == author_id][:max_count]
+        return same_author if same_author else uploader_comments
+    # No uploader comments: take first N from the first comment's author
+    first_author_id = comments[0].get("author_id") if comments else None
+    if not first_author_id:
+        return comments[:max_count]
+    same_author = [c for c in comments if c.get("author_id") == first_author_id][:max_count]
+    return same_author
+
+
+def _download_video_content(url: str, work_dir: Path) -> Tuple[str, str, str, Optional[Path], str]:
+    """
+    Use yt-dlp to download description, subtitle (or audio for transcription), thumbnail, and comments.
+    Returns (title, description, transcript, thumbnail_path or None, comments_text).
+    Comments are limited to first 2 from the same user (prefer uploader) for recipe extraction.
+    """
+    # Download metadata + subtitles + thumbnail + comments; if no subs, download audio
     cmd = [
         "yt-dlp",
         "--no-overwrites",
@@ -86,6 +178,8 @@ def _download_video_content(url: str, work_dir: Path) -> Tuple[str, str, str, Op
         "--write-auto-subs",
         "--sub-langs", "en,en-US,en-GB",
         "--convert-subs", "srt",
+        "--write-comments",
+        "--extractor-args", "youtube:max-comments=100",  # YouTube only; other sites use default
         "--restrict-filenames",
         "-x",
         "--audio-format", "m4a",
@@ -102,12 +196,27 @@ def _download_video_content(url: str, work_dir: Path) -> Tuple[str, str, str, Op
     description = ""
     transcript = ""
 
+    comments_text = ""
     # Find info.json (any)
     info_files = list(work_dir.glob("*.info.json"))
     if info_files:
         try:
             data = json.loads(info_files[0].read_text(encoding="utf-8"))
             title = (data.get("title") or "").strip() or "Untitled"
+            # Log yt-dlp metadata for debugging
+            meta = {k: data.get(k) for k in ("id", "title", "uploader", "channel", "duration", "webpage_url") if data.get(k) is not None}
+            logger.info("[video-import] yt-dlp info.json metadata: %s", json.dumps(meta, ensure_ascii=False))
+            # Comments: up to 2 from the same user (prefer uploader) for recipe in comments
+            raw_comments = data.get("comments") or []
+            if isinstance(raw_comments, list) and raw_comments:
+                selected = _comments_from_same_user(
+                    [c for c in raw_comments if isinstance(c, dict)],
+                    max_count=2,
+                )
+                parts = [(c.get("text") or "").strip() for c in selected if (c.get("text") or "").strip()]
+                comments_text = "\n---\n".join(parts).strip()
+                if comments_text:
+                    logger.info("[video-import] Using %d comment(s) from same user, total %d chars", len(selected), len(comments_text))
         except Exception as e:
             logger.warning("[video-import] Failed to read info.json: %s", e)
 
@@ -116,6 +225,7 @@ def _download_video_content(url: str, work_dir: Path) -> Tuple[str, str, str, Op
     if desc_files:
         try:
             description = desc_files[0].read_text(encoding="utf-8", errors="replace").strip()
+            logger.info("[video-import] yt-dlp description: len=%d, preview=%s", len(description), repr(description[:300]) if description else "(empty)")
         except Exception as e:
             logger.warning("[video-import] Failed to read description: %s", e)
 
@@ -163,7 +273,7 @@ def _download_video_content(url: str, work_dir: Path) -> Tuple[str, str, str, Op
             thumbnail_path = thumbs[0]
             break
 
-    return title, description, transcript, thumbnail_path
+    return title, description, transcript, thumbnail_path, comments_text
 
 
 def _instructions_to_numbered_steps(instructions: str) -> str:
@@ -191,7 +301,7 @@ def _instructions_to_numbered_steps(instructions: str) -> str:
     return "\n".join(f"{i + 1}. {step}" for i, step in enumerate(steps))
 
 
-def _create_video_recipe_prompt(title: str, description: str, transcript: str) -> str:
+def _create_video_recipe_prompt(title: str, description: str, transcript: str, comments: str = "") -> str:
     desc_words = _word_count(description)
     if desc_words >= DESCRIPTION_WORD_THRESHOLD:
         instruction = (
@@ -208,9 +318,23 @@ def _create_video_recipe_prompt(title: str, description: str, transcript: str) -
             "Extract title, ingredients, and instructions from the transcript. "
             "Infer cookTime and difficulty if possible."
         )
+    if comments:
+        instruction += (
+            " When comments are provided below, they are from the video uploader or top commenter "
+            "and often contain the full recipe (ingredients and instructions)—use them as primary source when relevant."
+        )
+
+    body = (
+        f"Title: {title}\n\n"
+        f"Description:\n{description or '(none)'}\n\n"
+        f"Transcript:\n{transcript or '(none)'}\n\n"
+    )
+    if comments:
+        body += f"Comments (may contain recipe from uploader/same user):\n{comments}\n\n"
 
     return (
-        "You are a recipe data extractor. From the following video recipe (title, description, and transcript), "
+        "You are a recipe data extractor. From the following video recipe (title, description, transcript"
+        + (", and comments" if comments else "") + "), "
         "return ONLY a JSON object with no other text.\n\n"
         f"Instructions: {instruction}\n\n"
         "JSON format:\n"
@@ -222,24 +346,53 @@ def _create_video_recipe_prompt(title: str, description: str, transcript: str) -
         '  "cookTime": "e.g. 30 min or Pending...",\n'
         '  "difficulty": "Easy or Medium or Advanced or Undetermined"\n'
         "}\n\n"
-        f"Title: {title}\n\n"
-        f"Description:\n{description or '(none)'}\n\n"
-        f"Transcript:\n{transcript or '(none)'}\n\n"
+        f"{body}"
         "JSON:"
     )
 
 
 def _extract_recipe_from_video_llm(
-    title: str, description: str, transcript: str, model, tokenizer, device
+    title: str, description: str, transcript: str, comments: str, model, tokenizer, device
 ) -> Dict[str, Any]:
-    """Call LLM to extract/summarize recipe from title + description + transcript."""
-    prompt = _create_video_recipe_prompt(title, description, transcript)
-    inputs = tokenizer(prompt, return_tensors="pt").to(device)
-    with torch.no_grad():
-        outputs = model.generate(**inputs, max_new_tokens=2048, pad_token_id=tokenizer.eos_token_id)
+    """Call LLM to extract/summarize recipe from title + description + transcript + optional comments.
+    Device is VIDEO_IMPORT_DEVICE (default: cuda). Uses LLM_INFERENCE_LOCK so only one LLM runs at a time.
+    """
+    from utils.llm_lock import LLM_INFERENCE_LOCK
+    with LLM_INFERENCE_LOCK:
+        return _extract_recipe_from_video_llm_impl(title, description, transcript, comments, model, tokenizer, device)
+
+
+def _extract_recipe_from_video_llm_impl(
+    title: str, description: str, transcript: str, comments: str, model, tokenizer, device
+) -> Dict[str, Any]:
+    """Implementation of LLM extraction (called while holding LLM_INFERENCE_LOCK)."""
+    prompt = _create_video_recipe_prompt(title, description, transcript, comments)
+    infer_device = VIDEO_IMPORT_DEVICE
+    if infer_device == "cuda":
+        try:
+            if not torch.cuda.is_available():
+                logger.warning("[video-import] VIDEO_IMPORT_DEVICE=cuda but CUDA not available; using CPU")
+                infer_device = "cpu"
+            else:
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+        except Exception:
+            infer_device = "cpu"
+    if infer_device == "cpu":
+        logger.info("[video-import] Using CPU for LLM (VIDEO_IMPORT_DEVICE=%s)", VIDEO_IMPORT_DEVICE)
+    original_device = next(model.parameters()).device
+    try:
+        if str(infer_device) == "cpu" and str(original_device) != "cpu":
+            model.to("cpu")
+        inputs = tokenizer(prompt, return_tensors="pt").to(infer_device)
+        with torch.no_grad():
+            outputs = model.generate(**inputs, max_new_tokens=2048, pad_token_id=tokenizer.eos_token_id)
+    finally:
+        if str(original_device) != "cpu":
+            model.to(original_device)
     text = tokenizer.decode(outputs[0], skip_special_tokens=True)
     response = text[len(prompt):].strip().replace("---END---", "").strip()
-    data = parse_llm_response(response, model, tokenizer, device)
+    data = parse_llm_response(response, model, tokenizer, infer_device)
     if not data or (not data.get("title") and not data.get("ingredients") and not data.get("instructions")):
         data = extract_json_from_markdown(response)
     if not data:
@@ -283,9 +436,9 @@ async def import_recipe_from_video_url(
     work_dir = Path(tempfile.mkdtemp(prefix="video_import_"))
     try:
         update("downloading")
-        title, description, transcript, thumbnail_path = _download_video_content(url, work_dir)
-        if not title and not transcript and not description:
-            raise ValueError("Could not get title, description, or transcript from video URL")
+        title, description, transcript, thumbnail_path, comments_text = _download_video_content(url, work_dir)
+        if not title and not transcript and not description and not comments_text:
+            raise ValueError("Could not get title, description, transcript, or comments from video URL")
 
         image_url = ""
         if thumbnail_path and thumbnail_path.exists():
@@ -301,19 +454,40 @@ async def import_recipe_from_video_url(
         update("extracting_recipe")
         data = await run_llm_in_thread(
             _extract_recipe_from_video_llm,
-            title, description, transcript,
+            title, description, transcript, comments_text or "",
             model, tokenizer, device,
         )
         update("completed")
+
+        final_title, final_description = _video_title_and_description(
+            title, data.get("title"), data.get("description")
+        )
+        final_output = {
+            "title": final_title,
+            "description": final_description,
+            "ingredients": data.get("ingredients") or "",
+            "instructions": data.get("instructions") or "",
+            "imageUrl": image_url,
+            "tags": ["imported"],
+            "cookTime": data.get("cookTime") or "Pending...",
+            "difficulty": data.get("difficulty") or "Undetermined",
+        }
+        video_metadata = {
+            "video_title": title,
+            "video_description": description[:2000] if description else "",
+            "transcript_preview": transcript[:1500] if transcript else "",
+        }
+        _save_recipe_debug(job_id, url, video_metadata, data, final_output)
+
         return ImportRecipeResponse(
-            title=data.get("title") or title or "Untitled",
-            description=data.get("description") or "",
-            ingredients=data.get("ingredients") or "",
-            instructions=data.get("instructions") or "",
+            title=final_title,
+            description=final_description,
+            ingredients=final_output["ingredients"],
+            instructions=final_output["instructions"],
             imageUrl=image_url,
             tags=["imported"],
-            cookTime=data.get("cookTime") or "Pending...",
-            difficulty=data.get("difficulty") or "Undetermined",
+            cookTime=final_output["cookTime"],
+            difficulty=final_output["difficulty"],
             timeReasoning="",
             difficultyReasoning="",
         )
