@@ -195,6 +195,11 @@ IMPORTANT: End your response with '---END---' to indicate completion:"""
         Parse the LLM response to extract estimated time and difficulty.
         """
         try:
+            # Strip ---END--- if the LLM appended it (so JSON parsing succeeds)
+            response = response.strip()
+            if response.endswith("---END---"):
+                response = response[:-len("---END---")].strip()
+
             # Try to extract JSON from the response
             json_data = extract_json_from_markdown(response)
             

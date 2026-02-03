@@ -52,7 +52,8 @@ async def root():
         "endpoints": {
             "health": "/health",
             "recipe_analysis": "/recipe/analyze",
-            "recipe_import": "/recipe/import", 
+            "recipe_import": "/recipe/import",
+            "recipe_import_video": "/recipe/import-video",
             "recipe_auto_category": "/recipe/auto-category",
             "recipe_chat": "/recipe/chat",
             "recipe_health": "/recipe/health",
@@ -62,15 +63,6 @@ async def root():
     }
 
 # Legacy endpoints for backward compatibility
-@app.post("/analyze-recipe")
-async def legacy_analyze_recipe(request):
-    """Legacy endpoint - redirects to new recipe API"""
-    from fastapi import Request
-    from fastapi.responses import RedirectResponse
-    
-    # This will be handled by the recipe router
-    return await recipe_router.routes[0].endpoint(request)
-
 @app.post("/import-recipe")
 async def legacy_import_recipe(request: Request):
     """Legacy endpoint - start async import, return jobId. Poll GET /import-recipe/status/{jobId} for result."""
